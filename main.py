@@ -235,6 +235,76 @@ def _should_use_webhook() -> bool:
     return False
 
 
+def _patch_dns_for_proxy():
+    """Patch socket.getaddrinfo to fall back to Google DNS (8.8.8.8).
+
+    HF Spaces sometimes cannot resolve *.workers.dev (Cloudflare Workers).
+    This patches DNS resolution so that if the system resolver fails, we
+    send a raw UDP DNS query to Google's public DNS server — no extra
+    Python packages needed.
+    """
+    import socket as _socket
+    import struct
+    _orig = _socket.getaddrinfo
+
+    def _resolve_via_google_dns(hostname: str):
+        """Send a raw DNS A-record query to 8.8.8.8 and return the IP."""
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        sock.settimeout(5)
+
+        txid = b'\xaa\xbb'
+        flags = b'\x01\x00'  # recursion desired
+        qname = b''
+        for label in hostname.split('.'):
+            qname += bytes([len(label)]) + label.encode()
+        qname += b'\x00'
+        header = txid + flags + struct.pack('>HHHH', 1, 0, 0, 0)
+        question = qname + struct.pack('>HH', 1, 1)  # type A, class IN
+
+        sock.sendto(header + question, ('8.8.8.8', 53))
+        data, _ = sock.recvfrom(512)
+        sock.close()
+
+        # Skip header (12 bytes) and question section
+        off = 12
+        while data[off] != 0:
+            off += data[off] + 1
+        off += 5  # null byte + type (2) + class (2)
+
+        ans_count = struct.unpack('>H', data[6:8])[0]
+        for _ in range(ans_count):
+            # Skip answer name (handle compressed pointers)
+            if data[off] & 0xC0 == 0xC0:
+                off += 2
+            else:
+                while data[off] != 0:
+                    off += data[off] + 1
+                off += 1
+
+            # TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2) = 10 bytes before RDATA
+            rtype = struct.unpack('>H', data[off:off + 2])[0]
+            rdlen = struct.unpack('>H', data[off + 8:off + 10])[0]
+            off += 10 + rdlen  # skip fixed header + rdata
+
+            if rtype == 1 and rdlen == 4:  # A record, 4-byte IP
+                ip = '.'.join(str(b) for b in data[off - rdlen:off])
+                return ip
+        return None
+
+    def _patched(host, port, family=0, stype=0, proto=0, flags=0):
+        try:
+            return _orig(host, port, family, stype, proto, flags)
+        except _socket.gaierror:
+            ip = _resolve_via_google_dns(host)
+            if ip:
+                logger.info("DNS fallback resolved %s → %s via 8.8.8.8", host, ip)
+                return _orig(ip, port, family, stype, proto, flags)
+            raise
+
+    _socket.getaddrinfo = _patched
+    logger.info("DNS fallback patch installed (Google 8.8.8.8)")
+
+
 def main() -> None:
     """Main entry point — auto-detects environment and chooses polling vs webhook."""
     logger.info("=" * 50)
@@ -261,6 +331,7 @@ def main() -> None:
     if api_url:
         token = token.replace(":", "%3A")
         logger.info("Using proxy — token colon encoded for httpx compatibility")
+        _patch_dns_for_proxy()
 
     builder = Application.builder().token(token)
 
